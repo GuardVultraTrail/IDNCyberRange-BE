@@ -1,0 +1,239 @@
+// ===========================================================================
+// Prisma Schema — IDN Cyber Range
+// Fokus skripsi: RBAC (Role-Based Access Control) & mitigasi Privilege
+// Escalation / BOLA (Broken Object Level Authorization).
+//
+// Tiga entitas inti:
+//   - Role : peran pengguna (Admin / Peserta) -> dasar RBAC dinamis.
+//   - User : pengguna platform, terhubung ke satu Role.
+//   - Lab  : entitas lab/machine. Memiliki `ownerId` (pemilik) yang menjadi
+//            dasar pengecekan otorisasi tingkat-objek (anti-BOLA).
+// ===========================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// ROLE — sumber kebenaran untuk RBAC dinamis.
+// Nama role disimpan di DB (bukan hard-coded di kode) sehingga peran baru bisa
+// ditambah tanpa mengubah aplikasi. Middleware `requireRole` membaca nilai ini.
+// ---------------------------------------------------------------------------
+model Role {
+  id          Int      @id @default(autoincrement())
+  name        String   @unique // contoh: "ADMIN", "PESERTA"
+  description String?
+  users       User[]
+  createdAt   DateTime @default(now())
+
+  @@map("roles")
+}
+
+// ---------------------------------------------------------------------------
+// USER — akun pengguna. Password disimpan sebagai hash bcrypt (tidak pernah
+// plaintext). Relasi `role` dipakai untuk RBAC; relasi `labs` menandai lab
+// mana yang DIMILIKI user (dipakai untuk pengecekan BOLA).
+// ---------------------------------------------------------------------------
+model User {
+  id          Int        @id @default(autoincrement())
+  username    String     @unique
+  email       String     @unique
+  password    String // SELALU hash bcrypt, tidak pernah plaintext
+  displayName String? // nama tampilan (boleh diganti user); username tetap handle login
+  bio         String?    @db.Text
+  avatarUrl   String? // path relatif foto profil, mis. /uploads/avatars/xxx.png
+  xp          Int        @default(0) // akumulator XP — sumber kebenaran level
+  level       Int        @default(1) // diturunkan dari xp (floor(xp/100)+1)
+  status      UserStatus @default(ACTIVE)
+
+  // RBAC: setiap user terikat tepat ke satu Role.
+  roleId Int
+  role   Role @relation(fields: [roleId], references: [id])
+
+  // Kepemilikan objek: lab yang dibuat/dimiliki user ini.
+  labs Lab[] @relation("LabOwner")
+
+  // Pelacakan progress milik user (gamifikasi). Setiap baris di tabel-tabel ini
+  // SELALU terikat ke user pemiliknya -> tidak ada user yang bisa menambah
+  // progress atas nama user lain (anti-IDOR).
+  taskSolves  LabTaskSolve[]
+  submissions Submission[]
+  favorites   Favorite[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([roleId])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// LAB — entitas lab / machine cyber range.
+// `ownerId` adalah inti mitigasi BOLA: setiap operasi pada satu objek lab
+// wajib memverifikasi bahwa pemanggil adalah PEMILIK lab tersebut, atau ADMIN.
+// `published` memisahkan lab yang boleh dilihat publik vs draft pribadi.
+// ---------------------------------------------------------------------------
+model Lab {
+  id          Int        @id @default(autoincrement())
+  name        String
+  description String?    @db.Text
+  difficulty  Difficulty @default(EASY)
+  os          OsType     @default(LINUX)
+  logoUrl     String? // path relatif logo machine, mis. /uploads/logos/xxx.png
+  ipAddress   String
+  port        String? // contoh: "22, 80"
+
+  // Apakah Guided Mode (daftar tugas) diaktifkan untuk lab ini. Bila false,
+  // lab hanya punya flag untuk di-submit (tanpa pertanyaan terpandu).
+  guidedEnabled Boolean @default(true)
+
+  status    LabStatus @default(DRAFT)
+  published Boolean   @default(false)
+
+  // Relasi kepemilikan (anti-BOLA). onDelete: Cascade -> lab ikut terhapus
+  // bila pemiliknya dihapus.
+  ownerId Int
+  owner   User @relation("LabOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  // Daftar flag yang bisa di-submit (fleksibel, jumlah bebas).
+  flags LabFlag[]
+
+  // Pertanyaan Guided Mode (opsional, sesuai form admin di mockup).
+  tasks LabTask[]
+
+  // Relasi progress (agregat untuk dashboard & leaderboard).
+  taskSolves  LabTaskSolve[]
+  submissions Submission[]
+  favorites   Favorite[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+  @@index([status])
+  @@map("labs")
+}
+
+// ---------------------------------------------------------------------------
+// LABTASK — pertanyaan bertahap pada Guided Mode milik sebuah Lab.
+// ---------------------------------------------------------------------------
+model LabTask {
+  id       Int     @id @default(autoincrement())
+  labId    Int
+  lab      Lab     @relation(fields: [labId], references: [id], onDelete: Cascade)
+  order    Int     @default(0)
+  question String  @db.Text
+  answer   String // jawaban benar (dibandingkan case-insensitive di service)
+  hint     String? @db.Text
+
+  solves LabTaskSolve[]
+
+  @@index([labId])
+  @@map("lab_tasks")
+}
+
+// ---------------------------------------------------------------------------
+// LABTASKSOLVE — catatan bahwa seorang user telah menjawab benar satu task
+// Guided Mode. Unik per (user, task) -> idempotent (menjawab ulang tidak
+// menambah poin ganda). Dipakai menghitung progress per-lab di dashboard.
+// ---------------------------------------------------------------------------
+model LabTaskSolve {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  taskId    Int
+  task      LabTask  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  labId     Int
+  lab       Lab      @relation(fields: [labId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, taskId])
+  @@index([userId])
+  @@index([labId])
+  @@map("lab_task_solves")
+}
+
+// ---------------------------------------------------------------------------
+// LABFLAG — sebuah flag yang dapat di-submit pada lab. Jumlah bebas per lab
+// (mis. "User Flag", "Root Flag", "Web Flag", dst.). `value` bersifat rahasia
+// dan hanya diekspos ke pemilik/admin.
+// ---------------------------------------------------------------------------
+model LabFlag {
+  id     Int    @id @default(autoincrement())
+  labId  Int
+  lab    Lab    @relation(fields: [labId], references: [id], onDelete: Cascade)
+  label  String // nama flag yang ditampilkan ke peserta
+  value  String // string flag rahasia (dibandingkan persis di server)
+  points Int    @default(50)
+  order  Int    @default(0)
+
+  captures Submission[]
+
+  @@index([labId])
+  @@map("lab_flags")
+}
+
+// ---------------------------------------------------------------------------
+// SUBMISSION — catatan bahwa seorang user telah menangkap (capture) sebuah
+// flag tertentu. Unik per (user, flag) -> idempotent, poin tidak ganda.
+// ---------------------------------------------------------------------------
+model Submission {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  labId     Int
+  lab       Lab      @relation(fields: [labId], references: [id], onDelete: Cascade)
+  flagId    Int
+  flag      LabFlag  @relation(fields: [flagId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, flagId])
+  @@index([userId])
+  @@index([labId])
+  @@map("submissions")
+}
+
+// ---------------------------------------------------------------------------
+// FAVORITE — lab yang ditandai bintang oleh user. Disimpan di server agar
+// konsisten lintas perangkat (menggantikan localStorage).
+// ---------------------------------------------------------------------------
+model Favorite {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  labId     Int
+  lab       Lab      @relation(fields: [labId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, labId])
+  @@index([userId])
+  @@map("favorites")
+}
+
+enum UserStatus {
+  ACTIVE
+  BANNED
+}
+
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+  INSANE
+}
+
+enum OsType {
+  LINUX
+  WINDOWS
+}
+
+enum LabStatus {
+  ACTIVE
+  RETIRED
+  DRAFT
+}
